@@ -95,6 +95,22 @@ $comboBoxAlgorithm.Items.Add("DoD 5220-22.M Algorithm")
 $comboBoxAlgorithm.SelectedIndex = 0  # Default selection
 $form.Controls.Add($comboBoxAlgorithm)
 
+# Label for iterations selection
+$labelIterations = New-Object System.Windows.Forms.Label
+$labelIterations.Location = New-Object System.Drawing.Point(250,260)
+$labelIterations.Size = New-Object System.Drawing.Size(200,20)
+$labelIterations.Text = "Number of iterations:"
+$form.Controls.Add($labelIterations)
+
+# Numeric up down for selecting number of iterations
+$numericUpDownIterations = New-Object System.Windows.Forms.NumericUpDown
+$numericUpDownIterations.Location = New-Object System.Drawing.Point(250,280)
+$numericUpDownIterations.Size = New-Object System.Drawing.Size(120,20)
+$numericUpDownIterations.Minimum = 1
+$numericUpDownIterations.Maximum = 100
+$numericUpDownIterations.Value = 35
+$form.Controls.Add($numericUpDownIterations)
+
 # Text box to display progress messages
 $textBoxProgress = New-Object System.Windows.Forms.TextBox
 $textBoxProgress.Location = New-Object System.Drawing.Point(10,310)
@@ -113,7 +129,7 @@ $buttonDelete.Add_Click({
     $selectedItems = @($listBox.SelectedItems)  # Create a copy of selected items
     foreach ($item in $selectedItems) {
         if ($selectedAlgorithm -eq "Gutmann Algorithm") {
-            $iterations = 35
+            $iterations = $numericUpDownIterations.Value
             SecureDeleteFileGutmann -path $item -iterations $iterations -textBox $textBoxProgress
         }
         elseif ($selectedAlgorithm -eq "DoD 5220-22.M Algorithm") {
@@ -123,6 +139,15 @@ $buttonDelete.Add_Click({
     }
 })
 $form.Controls.Add($buttonDelete)
+
+# Event handler to enable/disable iterations selection based on algorithm selection
+$comboBoxAlgorithm.add_SelectedIndexChanged({
+    if ($comboBoxAlgorithm.SelectedItem -eq "Gutmann Algorithm") {
+        $numericUpDownIterations.Enabled = $true
+    } else {
+        $numericUpDownIterations.Enabled = $false
+    }
+})
 
 # Display the window
 $form.ShowDialog() | Out-Null
