@@ -1,153 +1,189 @@
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-# Function to overwrite file data with random data
-function OverwriteRandomData {
+# -----------------------------
+# Utility: Safe logging
+# -----------------------------
+function Write-LogUI {
     param (
-        [string]$path
+        [System.Windows.Forms.TextBox]$textBox,
+        [string]$message
     )
-    $fileSize = (Get-Item $path).Length
+    $timestamp = (Get-Date).ToString("HH:mm:ss")
+    $textBox.AppendText("[$timestamp] $message" + [Environment]::NewLine)
+    $textBox.ScrollToCaret()
+}
+
+# -----------------------------
+# Overwrite with cryptographically strong random data
+# -----------------------------
+function Overwrite-RandomData {
+    param ([string]$Path)
+
+    if (-not (Test-Path $Path)) { return }
+
+    $fileSize = (Get-Item $Path).Length
+    if ($fileSize -le 0) { return }
+
     $randomData = New-Object byte[] $fileSize
-    $rng = New-Object System.Security.Cryptography.RNGCryptoServiceProvider
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
     $rng.GetBytes($randomData)
-    [System.IO.File]::WriteAllBytes($path, $randomData)
+
+    [System.IO.File]::WriteAllBytes($Path, $randomData)
 }
 
-# Function to securely delete the file using Gutmann algorithm
-function SecureDeleteFileGutmann {
+# -----------------------------
+# Gutmann Secure Erase
+# -----------------------------
+function SecureDelete-Gutmann {
     param (
-        [string]$path,
-        [int]$iterations,
-        [System.Windows.Forms.TextBox]$textBox
+        [string]$Path,
+        [int]$Iterations,
+        [System.Windows.Forms.TextBox]$Output
     )
-    for ($i = 1; $i -le $iterations; $i++) {
-        $message = "Overwriting iteration $i/$iterations..."
-        $textBox.AppendText($message + [Environment]::NewLine)
-        OverwriteRandomData -path $path
+
+    for ($i = 1; $i -le $Iterations; $i++) {
+        Write-LogUI $Output "Gutmann pass $i/$Iterations..."
+        Overwrite-RandomData -Path $Path
     }
-    Remove-Item $path -Force
-    $message = "File securely deleted using Gutmann algorithm."
-    $textBox.AppendText($message + [Environment]::NewLine)
+
+    Remove-Item $Path -Force
+    Write-LogUI $Output "✔ File deleted using Gutmann ($Iterations passes)."
 }
 
-# Function to securely delete the file using DoD 5220-22.M algorithm
-function SecureDeleteFileDoD {
+# -----------------------------
+# DoD 5220.22-M (3 passes)
+# -----------------------------
+function SecureDelete-DoD {
     param (
-        [string]$path,
-        [System.Windows.Forms.TextBox]$textBox
+        [string]$Path,
+        [System.Windows.Forms.TextBox]$Output
     )
-    $randomData = New-Object byte[] 1
-    $randomData[0] = 0
-    for ($i = 1; $i -le 3; $i++) {
-        Write-Host "Overwriting iteration $i/3..."
-        [System.IO.File]::WriteAllBytes($path, $randomData)
+
+    $fileSize = (Get-Item $Path).Length
+
+    $patterns = @(
+        (0x00), # Pass 1 : zeros
+        (0xFF), # Pass 2 : ones
+        $null   # Pass 3 : random
+    )
+
+    for ($i = 0; $i -lt $patterns.Count; $i++) {
+        $pattern = $patterns[$i]
+
+        if ($pattern -eq $null) {
+            Write-LogUI $Output "DoD pass $($i+1)/3 (random)..."
+            Overwrite-RandomData -Path $Path
+        } else {
+            Write-LogUI $Output "DoD pass $($i+1)/3 (pattern 0x{0:X2})..." -f $pattern
+            $buffer = New-Object byte[] $fileSize
+            [byte[]]::Fill($buffer, [byte]$pattern)
+            [System.IO.File]::WriteAllBytes($Path, $buffer)
+        }
     }
-    Remove-Item $path -Force
-    $message = "File securely deleted using DoD 5220-22.M algorithm."
-    $textBox.AppendText($message + [Environment]::NewLine)
+
+    Remove-Item $Path -Force
+    Write-LogUI $Output "✔ File deleted using DoD 5220.22-M."
 }
 
-# Create the main window
+# -----------------------------
+# UI Setup
+# -----------------------------
 $form = New-Object System.Windows.Forms.Form
-$form.Text = "Select files to delete securely"
-$form.Size = New-Object System.Drawing.Size(600,400)
+$form.Text = "Secure File Shredder"
+$form.Size = New-Object System.Drawing.Size(600,420)
 $form.StartPosition = "CenterScreen"
 $form.FormBorderStyle = "FixedSingle"
+$form.MaximizeBox = $false
 
-# Create list box to display selected files
 $listBox = New-Object System.Windows.Forms.ListBox
 $listBox.Location = New-Object System.Drawing.Point(10,10)
 $listBox.Size = New-Object System.Drawing.Size(560,200)
 $listBox.SelectionMode = "MultiExtended"
 $form.Controls.Add($listBox)
 
-# Button to select files to delete
 $buttonSelect = New-Object System.Windows.Forms.Button
 $buttonSelect.Location = New-Object System.Drawing.Point(10,220)
 $buttonSelect.Size = New-Object System.Drawing.Size(120,30)
 $buttonSelect.Text = "Select"
 $buttonSelect.Add_Click({
-    $openFileDialog = New-Object System.Windows.Forms.OpenFileDialog
-    $openFileDialog.Multiselect = $true
-    $openFileDialog.Filter = "All files (*.*)|*.*"
-    $openFileDialog.InitialDirectory = [Environment]::GetFolderPath("Desktop")
-    $openFileDialog.Title = "Select files to delete securely"
-    $openFileDialog.ShowDialog() | Out-Null
-    foreach ($file in $openFileDialog.FileNames) {
-        $listBox.Items.Add($file)
+    $dlg = New-Object System.Windows.Forms.OpenFileDialog
+    $dlg.Multiselect = $true
+    $dlg.Filter = "All files (*.*)|*.*"
+    if ($dlg.ShowDialog() -eq "OK") {
+        foreach ($f in $dlg.FileNames) {
+            if (-not $listBox.Items.Contains($f)) {
+                $listBox.Items.Add($f)
+            }
+        }
     }
 })
 $form.Controls.Add($buttonSelect)
 
-# Label for algorithm selection
 $labelAlgorithm = New-Object System.Windows.Forms.Label
 $labelAlgorithm.Location = New-Object System.Drawing.Point(10,260)
-$labelAlgorithm.Size = New-Object System.Drawing.Size(200,20)
-$labelAlgorithm.Text = "Select deletion algorithm:"
+$labelAlgorithm.Text = "Deletion algorithm:"
 $form.Controls.Add($labelAlgorithm)
 
-# Combo box for selecting deletion algorithm
 $comboBoxAlgorithm = New-Object System.Windows.Forms.ComboBox
 $comboBoxAlgorithm.Location = New-Object System.Drawing.Point(10,280)
 $comboBoxAlgorithm.Size = New-Object System.Drawing.Size(200,20)
-$comboBoxAlgorithm.Items.Add("Gutmann Algorithm")
-$comboBoxAlgorithm.Items.Add("DoD 5220-22.M Algorithm")
-$comboBoxAlgorithm.SelectedIndex = 0  # Default selection
+$comboBoxAlgorithm.Items.Add("Gutmann (35 passes)")
+$comboBoxAlgorithm.Items.Add("DoD 5220.22-M (3 passes)")
+$comboBoxAlgorithm.SelectedIndex = 0
 $form.Controls.Add($comboBoxAlgorithm)
 
-# Label for iterations selection
 $labelIterations = New-Object System.Windows.Forms.Label
 $labelIterations.Location = New-Object System.Drawing.Point(250,260)
-$labelIterations.Size = New-Object System.Drawing.Size(200,20)
-$labelIterations.Text = "Number of iterations:"
+$labelIterations.Text = "Gutmann iterations:"
 $form.Controls.Add($labelIterations)
 
-# Numeric up down for selecting number of iterations
 $numericUpDownIterations = New-Object System.Windows.Forms.NumericUpDown
 $numericUpDownIterations.Location = New-Object System.Drawing.Point(250,280)
-$numericUpDownIterations.Size = New-Object System.Drawing.Size(120,20)
 $numericUpDownIterations.Minimum = 1
 $numericUpDownIterations.Maximum = 100
 $numericUpDownIterations.Value = 35
 $form.Controls.Add($numericUpDownIterations)
 
-# Text box to display progress messages
 $textBoxProgress = New-Object System.Windows.Forms.TextBox
 $textBoxProgress.Location = New-Object System.Drawing.Point(10,310)
-$textBoxProgress.Size = New-Object System.Drawing.Size(560,50)
+$textBoxProgress.Size = New-Object System.Drawing.Size(560,70)
 $textBoxProgress.Multiline = $true
 $textBoxProgress.ScrollBars = "Vertical"
 $form.Controls.Add($textBoxProgress)
 
-# Button to delete selected files
 $buttonDelete = New-Object System.Windows.Forms.Button
 $buttonDelete.Location = New-Object System.Drawing.Point(150,220)
 $buttonDelete.Size = New-Object System.Drawing.Size(120,30)
 $buttonDelete.Text = "Delete"
 $buttonDelete.Add_Click({
-    $selectedAlgorithm = $comboBoxAlgorithm.SelectedItem
-    $selectedItems = @($listBox.SelectedItems)  # Create a copy of selected items
-    foreach ($item in $selectedItems) {
-        if ($selectedAlgorithm -eq "Gutmann Algorithm") {
-            $iterations = $numericUpDownIterations.Value
-            SecureDeleteFileGutmann -path $item -iterations $iterations -textBox $textBoxProgress
+    $items = @($listBox.SelectedItems)
+    if ($items.Count -eq 0) {
+        Write-LogUI $textBoxProgress "⚠ No file selected."
+        return
+    }
+
+    foreach ($file in $items) {
+        if (-not (Test-Path $file)) {
+            Write-LogUI $textBoxProgress "⚠ File not found: $file"
+            continue
         }
-        elseif ($selectedAlgorithm -eq "DoD 5220-22.M Algorithm") {
-            SecureDeleteFileDoD -path $item -textBox $textBoxProgress
+
+        switch ($comboBoxAlgorithm.SelectedItem) {
+            "Gutmann (35 passes)" {
+                SecureDelete-Gutmann -Path $file -Iterations $numericUpDownIterations.Value -Output $textBoxProgress
+            }
+            "DoD 5220.22-M (3 passes)" {
+                SecureDelete-DoD -Path $file -Output $textBoxProgress
+            }
         }
-        $listBox.Items.Remove($item)
+        $listBox.Items.Remove($file)
     }
 })
 $form.Controls.Add($buttonDelete)
 
-# Event handler to enable/disable iterations selection based on algorithm selection
 $comboBoxAlgorithm.add_SelectedIndexChanged({
-    if ($comboBoxAlgorithm.SelectedItem -eq "Gutmann Algorithm") {
-        $numericUpDownIterations.Enabled = $true
-    } else {
-        $numericUpDownIterations.Enabled = $false
-    }
+    $numericUpDownIterations.Enabled = ($comboBoxAlgorithm.SelectedItem -like "Gutmann*")
 })
 
-# Display the window
 $form.ShowDialog() | Out-Null
