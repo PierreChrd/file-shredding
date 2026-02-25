@@ -342,10 +342,10 @@ function Invoke-ReTrim {
     )
     try {
         Optimize-Volume -DriveLetter $DriveLetter -ReTrim -Verbose -ErrorAction Stop | Out-Null
-        Write-Log "✔ ReTrim done on $DriveLetter:`\" $Output
+        Write-Log "✔ ReTrim done on $DriveLetter :`\" $Output
         return $true
     } catch {
-        Write-Log "⚠ ReTrim failed on $DriveLetter:`\" $Output
+        Write-Log "⚠ ReTrim failed on $DriveLetter :`\" $Output
         return $false
     }
 }
