@@ -13,17 +13,23 @@ param(
 
     [switch]$Confirm,
 
-    # --- Nouveaux paramètres ---
-    [switch]$UltraSecure,     # Chaîne “pro”
-    [switch]$Verify,          # Vérifie la dernière passe (0x00)
-    [int]$RenameCount = 3,    # Renommages aléatoires avant wipe
-    [switch]$WipeFreeSpace,   # Wipe espace libre des volumes concernés
-    [switch]$Trim             # Optimize-Volume -ReTrim sur les volumes
+    # Options avancées de suppression
+    [switch]$UltraSecure,
+    [switch]$Verify,          # Vérifier la dernière passe (0x00)
+    [int]$RenameCount = 3,
+    [switch]$WipeFreeSpace,
+    [switch]$Trim,
+
+    # === NEW: Vérification / Score
+    [switch]$VerifyDeletion   # En CLI: calcule et affiche le score après l’opération
 )
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
+# -----------------------------
+# Logging UI/Console
+# -----------------------------
 function Write-Log {
     param (
         [string]$Message,
@@ -50,7 +56,9 @@ function Get-DriveLetterFromPath {
     return $null
 }
 
-# --- Random strong ---
+# -----------------------------
+# Overwrite helpers (chunked)
+# -----------------------------
 function Overwrite-RandomData {
     param ([string]$Path)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
@@ -78,7 +86,6 @@ function Overwrite-RandomData {
     }
 }
 
-# --- Pattern overwrite with verification-friendly last pass ---
 function Overwrite-Pattern {
     param (
         [string]$Path,
@@ -116,13 +123,13 @@ function Verify-Pattern {
     $len = (Get-Item -LiteralPath $Path -Force).Length
     if ($len -le 0) { return $true }
 
-    $probes = 8  # lectures aléatoires
+    $probes = 8
     $chunk  = 1MB
     $rnd = New-Object System.Random
     $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
     try {
         for ($i=0; $i -lt $probes; $i++) {
-            $offset = [long]($rnd.NextDouble() * [double]$len)
+            $offset = [long]([double]$len * $rnd.NextDouble())
             if ($offset -gt ($len - $chunk)) { $offset = $len - $chunk }
             if ($offset -lt 0) { $offset = 0 }
             $buf = New-Object byte[] $chunk
@@ -136,6 +143,9 @@ function Verify-Pattern {
     } finally { $fs.Close() }
 }
 
+# -----------------------------
+# ADS helpers (NTFS)
+# -----------------------------
 function Get-AlternateStreams {
     param([string]$Path)
     try {
@@ -150,21 +160,26 @@ function Remove-ADS-Secure {
         [System.Windows.Forms.TextBox]$Output
     )
     $adsList = Get-AlternateStreams -Path $Path
+    $ok = $true
     foreach ($ads in $adsList) {
         $adsPath = "$Path`:$($ads.Stream)"
         try {
-            # 2 passes random + 1 pass 0x00
             Overwrite-RandomData -Path $adsPath
             Overwrite-RandomData -Path $adsPath
             Overwrite-Pattern    -Path $adsPath -Pattern 0x00 | Out-Null
             Remove-Item -LiteralPath $adsPath -Force -ErrorAction SilentlyContinue
             Write-Log "ADS wiped: $adsPath" $Output
         } catch {
+            $ok = $false
             Write-Log "⚠ ADS wipe failed: $adsPath => $($_.Exception.Message)" $Output
         }
     }
+    return $ok
 }
 
+# -----------------------------
+# Prep: attributes + renames + timestamp fog
+# -----------------------------
 function Prepare-FileForDeletion {
     param(
         [string]$Path,
@@ -184,7 +199,6 @@ function Prepare-FileForDeletion {
         } catch { break }
     }
 
-    # timestamps brouillés
     try {
         $dt = Get-Date ((Get-Date).AddYears(- (Get-Random -Min 5 -Max 15))) -Hour (Get-Random -Min 0 -Max 23) -Minute (Get-Random -Min 0 -Max 59)
         (Get-Item -LiteralPath $current -Force).CreationTime  = $dt
@@ -195,6 +209,9 @@ function Prepare-FileForDeletion {
     return $current
 }
 
+# -----------------------------
+# Algorithms
+# -----------------------------
 function SecureDelete-DoD {
     param (
         [string]$Path,
@@ -203,7 +220,6 @@ function SecureDelete-DoD {
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
     if ($item.PSIsContainer) { throw "DoD expects a file. Got directory: $Path" }
 
-    $fileSize = $item.Length
     $patterns = @(0x00, 0xFF, $null)
     for ($i = 0; $i -lt $patterns.Count; $i++) {
         $pattern = $patterns[$i]
@@ -236,7 +252,6 @@ function SecureDelete-Gutmann {
     Write-Log "✔ Deleted (Gutmann $Iterations passes): $Path" $Output
 }
 
-# --- Nouveau : SecureDelete-Ultra (pro) ---
 function SecureDelete-Ultra {
     param(
         [string]$Path,
@@ -244,18 +259,14 @@ function SecureDelete-Ultra {
         [switch]$Verify,
         [System.Windows.Forms.TextBox]$Output
     )
-
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         Write-Log "⚠ File not found: $Path" $Output
-        return $false
+        return [pscustomobject]@{ VerifiedZero = $false; ADSWiped=$false; Removed=$false }
     }
 
     $work = Prepare-FileForDeletion -Path $Path -RenameCount $RenameCount
+    $adsOk = Remove-ADS-Secure -Path $work -Output $Output
 
-    # ADS
-    Remove-ADS-Secure -Path $work -Output $Output
-
-    # Wipes: 2x random + 1x zero + optional verify
     Write-Log "UltraSecure: random pass 1 => $work" $Output
     Overwrite-RandomData -Path $work
     Write-Log "UltraSecure: random pass 2 => $work" $Output
@@ -263,22 +274,217 @@ function SecureDelete-Ultra {
     Write-Log "UltraSecure: final 0x00 pass => $work" $Output
     Overwrite-Pattern -Path $work -Pattern 0x00
 
+    $verified = $false
     if ($Verify) {
         Write-Log "UltraSecure: verifying 0x00 pattern..." $Output
-        $ok = Verify-Pattern -Path $work -Expected 0x00
-        if (-not $ok) {
-            Write-Log "❌ Verification failed: $work" $Output
-            return $false
-        } else {
-            Write-Log "✔ Verification OK" $Output
-        }
+        $verified = Verify-Pattern -Path $work -Expected 0x00
+        if (-not $verified) { Write-Log "❌ Verification failed: $work" $Output } else { Write-Log "✔ Verification OK" $Output }
     }
 
     Remove-Item -LiteralPath $work -Force
     Write-Log "✔ Deleted (UltraSecure): $Path" $Output
+
+    return [pscustomobject]@{
+        VerifiedZero = [bool]$verified
+        ADSWiped     = [bool]$adsOk
+        Removed      = $true
+    }
+}
+
+# -----------------------------
+# Free space wipe & TRIM
+# -----------------------------
+function Invoke-FreeSpaceWipe {
+    param(
+        [Parameter(Mandatory=$true)][ValidatePattern("^[A-Z]$")][string]$DriveLetter,
+        [System.Windows.Forms.TextBox]$Output
+    )
+    $root = "$DriveLetter`:\"
+    Write-Log "Wiping free space on $root ..." $Output
+
+    $vol = Get-Volume -DriveLetter $DriveLetter -ErrorAction SilentlyContinue
+    $isNTFS = $false
+    if ($vol -and $vol.FileSystem -eq 'NTFS') { $isNTFS = $true }
+
+    if ($isNTFS) {
+        try {
+            Start-Process -FilePath "$env:SystemRoot\System32\cipher.exe" -ArgumentList "/w:$root" -Wait -NoNewWindow
+            Write-Log "✔ cipher /w completed on $root" $Output
+            return $true
+        } catch {
+            Write-Log "cipher /w failed on $root, fallback to fill-file method. Reason: $($_.Exception.Message)" $Output
+        }
+    }
+
+    $wipeFile = Join-Path $root "__wipe_free_space__.bin"
+    try {
+        $fs = [System.IO.File]::Open($wipeFile, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        $buf = New-Object byte[] (8MB)
+        $wrote = 0
+        try {
+            while ($true) {
+                $fs.Write($buf, 0, $buf.Length)
+                $wrote += $buf.Length
+                if (($wrote % (512MB)) -eq 0) { Write-Log ("... wrote {0:N0} MB" -f ($wrote/1MB)) $Output }
+            }
+        } catch { } finally { $fs.Flush($true); $fs.Close() }
+    } catch { Write-Log "⚠ Fallback write failed: $($_.Exception.Message)" $Output } finally {
+        try { Remove-Item -LiteralPath $wipeFile -Force -ErrorAction SilentlyContinue } catch {}
+    }
+    Write-Log "✔ free space wipe (fallback) completed on $root" $Output
     return $true
 }
 
+function Invoke-ReTrim {
+    param(
+        [Parameter(Mandatory=$true)][ValidatePattern("^[A-Z]$")][string]$DriveLetter,
+        [System.Windows.Forms.TextBox]$Output
+    )
+    try {
+        Optimize-Volume -DriveLetter $DriveLetter -ReTrim -Verbose -ErrorAction Stop | Out-Null
+        Write-Log "✔ ReTrim done on $DriveLetter:`\" $Output
+        return $true
+    } catch {
+        Write-Log "⚠ ReTrim failed on $DriveLetter:`\" $Output
+        return $false
+    }
+}
+
+# -----------------------------
+# === NEW: Détection de snapshots (VSS)
+# -----------------------------
+function Test-VolumeHasShadowCopies {
+    param([Parameter(Mandatory=$true)][ValidatePattern("^[A-Z]$")][string]$DriveLetter)
+    try {
+        $out = (vssadmin list shadows) 2>$null
+        if (-not $out) { return $false }
+        # Cherche des snapshots qui pointent sur la même partition (Volume name contient la lettre)
+        # C'est un check heuristique (non destructif)
+        return ($out -match ("Volume: .*" + [regex]::Escape("$DriveLetter") + ":\\"))
+    } catch { return $false }
+}
+
+# -----------------------------
+# === NEW: Score de délétion
+# -----------------------------
+function New-DeletionReport {
+    param(
+        [string]$OriginalPath,
+        [string]$Algorithm,
+        [switch]$UltraSecure,
+        [bool]$VerifiedZero,
+        [bool]$ADSWiped,
+        [bool]$Removed,
+        [bool]$FreeSpaceWipeDone,
+        [bool]$TrimDone
+    )
+    $drive = Get-DriveLetterFromPath -FullPath $OriginalPath
+    $hasVSS = if ($drive) { Test-VolumeHasShadowCopies -DriveLetter $drive } else { $false }
+
+    [pscustomobject]@{
+        OriginalPath       = $OriginalPath
+        Algorithm          = if ($UltraSecure) { "UltraSecure" } else { $Algorithm }
+        VerifiedZero       = [bool]$VerifiedZero
+        ADSWiped           = [bool]$ADSWiped
+        Removed            = [bool]$Removed
+        FreeSpaceWipeDone  = [bool]$FreeSpaceWipeDone
+        TrimDone           = [bool]$TrimDone
+        VolumeHasVSS       = [bool]$hasVSS
+        Timestamp          = (Get-Date)
+    }
+}
+
+function Compute-DeletionScore {
+    param([Parameter(Mandatory=$true)]$Report)
+
+    $score   = 0
+    $details = @()
+
+    if ($Report.Removed) {
+        $score += 20; $details += "+20 : fichier supprimé (pas de Corbeille)"
+    } else {
+        $details += "  0 : fichier toujours présent"
+    }
+
+    if ($Report.VerifiedZero) {
+        $score += 40; $details += "+40 : vérification contenu (0x00) OK"
+    } else {
+        $details += "  0 : vérification du contenu non effectuée/échouée"
+    }
+
+    if ($Report.ADSWiped) {
+        $score += 20; $details += "+20 : ADS nettoyés"
+    } else {
+        $details += "  0 : ADS non confirmés"
+    }
+
+    if ($Report.FreeSpaceWipeDone) {
+        $score += 10; $details += "+10 : espace libre écrasé"
+    } else {
+        $details += "  0 : espace libre non écrasé"
+    }
+
+    if ($Report.TrimDone) {
+        $score += 10; $details += "+10 : TRIM/ReTrim effectué"
+    } else {
+        $details += "  0 : TRIM non effectué"
+    }
+
+    if ($Report.VolumeHasVSS) {
+        $score -= 10; $details += "−10 : snapshots VSS présents (risque résiduel)"
+    }
+
+    if ($score -lt 0) { $score = 0 }
+    if ($score -gt 100) { $score = 100 }
+
+    # classification simple
+    $class = switch ($score) {
+        {$_ -ge 98} { "Effacement irréversible" ; break }
+        {$_ -ge 90} { "Effacement excellent" ; break }
+        {$_ -ge 75} { "Bon" ; break }
+        {$_ -ge 50} { "Moyen" ; break }
+        default     { "Faible (récupération plausible)" }
+    }
+
+    [pscustomobject]@{
+        Score = [int][Math]::Round($score,0)
+        Classification = $class
+        Breakdown = $details
+    }
+}
+
+# -----------------------------
+# === NEW: Quick check indépendant
+# -----------------------------
+function Test-DeletionQuickCheck {
+    param([Parameter(Mandatory=$true)][string]$Path)
+
+    $exists = Test-Path -LiteralPath $Path
+    $drive = Get-DriveLetterFromPath -FullPath $Path
+    $hasVSS = if ($drive) { Test-VolumeHasShadowCopies -DriveLetter $drive } else { $false }
+
+    if ($exists) {
+        return [pscustomobject]@{
+            Score = 0
+            Classification = "Fichier présent"
+            Breakdown = @("0 : fichier toujours présent")
+        }
+    } else {
+        # Estimation prudente sans logs d’opération
+        $score = 60
+        $details = @("+60 : fichier absent (aucune preuve contraire)")
+        if ($hasVSS) { $score -= 10; $details += "−10 : snapshots VSS présents" }
+        return [pscustomobject]@{
+            Score = [int]$score
+            Classification = if ($score -ge 75) {"Bon"} elseif ($score -ge 50) {"Moyen"} else {"Faible"}
+            Breakdown = $details
+        }
+    }
+}
+
+# -----------------------------
+# Secure delete (file)
+# -----------------------------
 function SecureDelete-File {
     param(
         [string]$Path,
@@ -287,29 +493,68 @@ function SecureDelete-File {
         [switch]$UltraSecure,
         [switch]$Verify,
         [int]$RenameCount = 3,
+        [switch]$WipeFreeSpace,
+        [switch]$Trim,
         [System.Windows.Forms.TextBox]$Output
     )
 
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         Write-Log "⚠ File not found: $Path" $Output
-        return
+        return $null
     }
+
+    $fsWiped = $false
+    $trimmed = $false
+    $algo    = $Algorithm
+    $verified0 = $false
+    $adsOk     = $false
+    $removed   = $false
 
     if ($UltraSecure) {
-        [void](SecureDelete-Ultra -Path $Path -RenameCount $RenameCount -Verify:$Verify -Output $Output)
-        return
+        $result = SecureDelete-Ultra -Path $Path -RenameCount $RenameCount -Verify:$Verify -Output $Output
+        $verified0 = [bool]$result.VerifiedZero
+        $adsOk     = [bool]$result.ADSWiped
+        $removed   = [bool]$result.Removed
+        $algo = "UltraSecure"
+    } else {
+        $path2 = Prepare-FileForDeletion -Path $Path -RenameCount $RenameCount
+        $adsOk = Remove-ADS-Secure -Path $path2 -Output $Output
+        switch ($Algorithm) {
+            "Gutmann" { SecureDelete-Gutmann -Path $path2 -Iterations $Passes -Output $Output }
+            "DoD"     { SecureDelete-DoD     -Path $path2 -Output $Output }
+        }
+        $removed = $true
+
+        if ($Verify -and (Test-Path -LiteralPath $path2 -PathType Leaf)) {
+            # Cas très rare si suppression a échoué
+            $verified0 = Verify-Pattern -Path $path2 -Expected 0x00
+        } elseif ($Verify) {
+            # Vérif non applicable car déjà supprimé
+            $verified0 = $false
+        }
     }
 
-    $path2 = Prepare-FileForDeletion -Path $Path -RenameCount $RenameCount
-    Remove-ADS-Secure -Path $path2 -Output $Output
+    # Wipe espace libre / TRIM si demandé
+    $drv = Get-DriveLetterFromPath -FullPath $Path
+    if ($WipeFreeSpace -and $drv) { $fsWiped = Invoke-FreeSpaceWipe -DriveLetter $drv -Output $Output }
+    if ($Trim -and $drv) { $trimmed = Invoke-ReTrim -DriveLetter $drv -Output $Output }
 
-    switch ($Algorithm) {
-        "Gutmann" { SecureDelete-Gutmann -Path $path2 -Iterations $Passes -Output $Output }
-        "DoD"     { SecureDelete-DoD     -Path $path2 -Output $Output }
-        default   { throw "Unknown algorithm: $Algorithm" }
+    # Rapport & Score
+    $report = New-DeletionReport -OriginalPath $Path -Algorithm $Algorithm -UltraSecure:$UltraSecure -VerifiedZero:$verified0 -ADSWiped:$adsOk -Removed:$removed -FreeSpaceWipeDone:$fsWiped -TrimDone:$trimmed
+    $score  = Compute-DeletionScore -Report $report
+
+    Write-Log ("► Deletion Score: {0}% — {1}" -f $score.Score, $score.Classification) $Output
+    foreach ($line in $score.Breakdown) { Write-Log ("   " + $line) $Output }
+
+    return [pscustomobject]@{
+        Report = $report
+        Score  = $score
     }
 }
 
+# -----------------------------
+# Secure delete (folder)
+# -----------------------------
 function SecureDelete-Folder {
     param(
         [string]$FolderPath,
@@ -326,13 +571,13 @@ function SecureDelete-Folder {
 
     if (-not (Test-Path -LiteralPath $FolderPath -PathType Container)) {
         Write-Log "⚠ Folder not found: $FolderPath" $Output
-        return
+        return $null
     }
 
     $folderItem = Get-Item -LiteralPath $FolderPath -Force
     if ($folderItem.Attributes -band [IO.FileAttributes]::ReparsePoint) {
         Write-Log "⚠ Skipping reparse point: $FolderPath" $Output
-        return
+        return $null
     }
 
     Write-Log "Scanning folder: $FolderPath (Recurse=$Recurse)" $Output
@@ -343,19 +588,21 @@ function SecureDelete-Folder {
         Get-ChildItem -LiteralPath $FolderPath -File -Force -ErrorAction SilentlyContinue
     }
 
-    $touchedDrives = New-Object System.Collections.Generic.HashSet[string]
+    $fsWipedOverall = $false
+    $trimmedOverall = $false
+    $drv = Get-DriveLetterFromPath -FullPath $FolderPath
 
+    $allReports = @()
     foreach ($f in $files) {
         try {
-            SecureDelete-File -Path $f.FullName -Algorithm $Algorithm -Passes $Passes -UltraSecure:$UltraSecure -Verify:$Verify -RenameCount $RenameCount -Output $Output
-            $drv = Get-DriveLetterFromPath -FullPath $f.FullName
-            if ($drv) { [void]$touchedDrives.Add($drv) }
+            $res = SecureDelete-File -Path $f.FullName -Algorithm $Algorithm -Passes $Passes -UltraSecure:$UltraSecure -Verify:$Verify -RenameCount $RenameCount -Output $Output
+            if ($res) { $allReports += $res.Report }
         } catch {
             Write-Log "❌ File delete failed: $($f.FullName) => $($_.Exception.Message)" $Output
         }
     }
 
-    # Remove dirs bottom-up
+    # Remove directories bottom-up
     $dirs = if ($Recurse) {
         Get-ChildItem -LiteralPath $FolderPath -Recurse -Directory -Force -ErrorAction SilentlyContinue |
         Sort-Object FullName -Descending
@@ -371,101 +618,44 @@ function SecureDelete-Folder {
     try {
         Remove-Item -LiteralPath $FolderPath -Force -ErrorAction SilentlyContinue
         Write-Log "✔ Folder removed: $FolderPath" $Output
-        $drv = Get-DriveLetterFromPath -FullPath $FolderPath
-        if ($drv) { [void]$touchedDrives.Add($drv) }
+        if ($drv -and $WipeFreeSpace) { $fsWipedOverall = Invoke-FreeSpaceWipe -DriveLetter $drv -Output $Output }
+        if ($drv -and $Trim) { $trimmedOverall = Invoke-ReTrim -DriveLetter $drv -Output $Output }
     } catch {
         Write-Log "⚠ Could not remove folder (in use or not empty): $FolderPath" $Output
     }
 
-    if ($WipeFreeSpace -and $touchedDrives.Count -gt 0) {
-        foreach ($drive in $touchedDrives) {
-            Invoke-FreeSpaceWipe -DriveLetter $drive -Output $Output
-            if ($Trim) { Invoke-ReTrim -DriveLetter $drive -Output $Output }
-        }
+    # Score dossier: moyenne pondérée des fichiers, + bonus si wipe/trim sur volume
+    if ($allReports.Count -gt 0) {
+        $scores = $allReports | ForEach-Object { (Compute-DeletionScore -Report $_).Score }
+        $avg = [int]([Math]::Round(($scores | Measure-Object -Average).Average,0))
+        if ($fsWipedOverall) { $avg = [Math]::Min(100, $avg + 5) }
+        if ($trimmedOverall) { $avg = [Math]::Min(100, $avg + 5) }
+        Write-Log ("► Folder Deletion Score (avg): {0}%" -f $avg) $Output
+        return [pscustomobject]@{ Score = $avg; Reports = $allReports }
+    } else {
+        return $null
     }
 }
 
-# --- Wipe de l’espace libre ---
-function Invoke-FreeSpaceWipe {
-    param(
-        [Parameter(Mandatory=$true)][ValidatePattern("^[A-Z]$")][string]$DriveLetter,
-        [System.Windows.Forms.TextBox]$Output
-    )
-    $root = "$DriveLetter`:\"
-    Write-Log "Wiping free space on $root ..." $Output
-
-    # NTFS ? -> cipher /w: sinon fallback “fichier de remplissage”
-    $vol = Get-Volume -DriveLetter $DriveLetter -ErrorAction SilentlyContinue
-    $isNTFS = $false
-    if ($vol -and $vol.FileSystem -eq 'NTFS') { $isNTFS = $true }
-
-    if ($isNTFS) {
-        try {
-            Start-Process -FilePath "$env:SystemRoot\System32\cipher.exe" -ArgumentList "/w:$root" -Wait -NoNewWindow
-            Write-Log "✔ cipher /w completed on $root" $Output
-            return
-        } catch {
-            Write-Log "cipher /w failed on $root, fallback to fill-file method. Reason: $($_.Exception.Message)" $Output
-        }
-    }
-
-    # Fallback: remplir l’espace libre
-    $wipeFile = Join-Path $root "__wipe_free_space__.bin"
-    try {
-        $fs = [System.IO.File]::Open($wipeFile, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
-        $buf = New-Object byte[] (8MB)
-        # On écrit des zéros (suffisant pour clear l’espace libre)
-        $wrote = 0
-        try {
-            while ($true) {
-                $fs.Write($buf, 0, $buf.Length)
-                $wrote += $buf.Length
-                if (($wrote % (512MB)) -eq 0) { Write-Log ("... wrote {0:N0} MB" -f ($wrote/1MB)) $Output }
-            }
-        } catch {
-            # Arrive quand disque plein
-        } finally {
-            $fs.Flush($true)
-            $fs.Close()
-        }
-    } catch { Write-Log "⚠ Fallback write failed: $($_.Exception.Message)" $Output }
-    finally {
-        try { Remove-Item -LiteralPath $wipeFile -Force -ErrorAction SilentlyContinue } catch {}
-    }
-    Write-Log "✔ free space wipe (fallback) completed on $root" $Output
-}
-
-# --- TRIM/ReTrim ---
-function Invoke-ReTrim {
-    param(
-        [Parameter(Mandatory=$true)][ValidatePattern("^[A-Z]$")][string]$DriveLetter,
-        [System.Windows.Forms.TextBox]$Output
-    )
-    try {
-        Optimize-Volume -DriveLetter $DriveLetter -ReTrim -Verbose -ErrorAction Stop | Out-Null
-        Write-Log "✔ ReTrim done on $DriveLetter:`\" $Output
-    } catch {
-        Write-Log "⚠ ReTrim failed on $DriveLetter:`\" $Output
-    }
-}
-
-# --- GUI identique à avant (tu peux l’enrichir pour exposer UltraSecure) ---
+# -----------------------------
+# GUI
+# -----------------------------
 function Start-ShredderGUI {
     $form = New-Object System.Windows.Forms.Form
     $form.Text = "Secure File Shredder"
-    $form.Size = New-Object System.Drawing.Size(620,460)
+    $form.Size = New-Object System.Drawing.Size(660,500)
     $form.StartPosition = "CenterScreen"
     $form.FormBorderStyle = "FixedSingle"
     $form.MaximizeBox = $false
 
     $listBox = New-Object System.Windows.Forms.ListBox
     $listBox.Location = New-Object System.Drawing.Point(10,10)
-    $listBox.Size = New-Object System.Drawing.Size(580,200)
+    $listBox.Size = New-Object System.Drawing.Size(620,220)
     $listBox.SelectionMode = "MultiExtended"
     $form.Controls.Add($listBox)
 
     $buttonSelect = New-Object System.Windows.Forms.Button
-    $buttonSelect.Location = New-Object System.Drawing.Point(10,220)
+    $buttonSelect.Location = New-Object System.Drawing.Point(10,240)
     $buttonSelect.Size = New-Object System.Drawing.Size(120,30)
     $buttonSelect.Text = "Select"
     $buttonSelect.Add_Click({
@@ -482,14 +672,26 @@ function Start-ShredderGUI {
     })
     $form.Controls.Add($buttonSelect)
 
+    $buttonDelete = New-Object System.Windows.Forms.Button
+    $buttonDelete.Location = New-Object System.Drawing.Point(140,240)
+    $buttonDelete.Size = New-Object System.Drawing.Size(120,30)
+    $buttonDelete.Text = "Delete"
+    $form.Controls.Add($buttonDelete)
+
+    $buttonAnalyze = New-Object System.Windows.Forms.Button
+    $buttonAnalyze.Location = New-Object System.Drawing.Point(270,240)
+    $buttonAnalyze.Size = New-Object System.Drawing.Size(150,30)
+    $buttonAnalyze.Text = "Analyser / Scorer"
+    $form.Controls.Add($buttonAnalyze)
+
     $labelAlgorithm = New-Object System.Windows.Forms.Label
-    $labelAlgorithm.Location = New-Object System.Drawing.Point(10,260)
+    $labelAlgorithm.Location = New-Object System.Drawing.Point(10,280)
     $labelAlgorithm.Text = "Deletion algorithm:"
     $form.Controls.Add($labelAlgorithm)
 
     $comboBoxAlgorithm = New-Object System.Windows.Forms.ComboBox
-    $comboBoxAlgorithm.Location = New-Object System.Drawing.Point(10,280)
-    $comboBoxAlgorithm.Size = New-Object System.Drawing.Size(220,20)
+    $comboBoxAlgorithm.Location = New-Object System.Drawing.Point(10,300)
+    $comboBoxAlgorithm.Size = New-Object System.Drawing.Size(240,20)
     $comboBoxAlgorithm.Items.Add("UltraSecure (Pro)")
     $comboBoxAlgorithm.Items.Add("Gutmann (35 passes)")
     $comboBoxAlgorithm.Items.Add("DoD 5220.22-M (3 passes)")
@@ -497,46 +699,55 @@ function Start-ShredderGUI {
     $form.Controls.Add($comboBoxAlgorithm)
 
     $checkVerify = New-Object System.Windows.Forms.CheckBox
-    $checkVerify.Location = New-Object System.Drawing.Point(250,280)
+    $checkVerify.Location = New-Object System.Drawing.Point(270,300)
     $checkVerify.Text = "Verify last pass"
     $checkVerify.Checked = $true
     $form.Controls.Add($checkVerify)
 
+    $checkWipe = New-Object System.Windows.Forms.CheckBox
+    $checkWipe.Location = New-Object System.Drawing.Point(400,300)
+    $checkWipe.Text = "Wipe free space"
+    $checkWipe.Checked = $false
+    $form.Controls.Add($checkWipe)
+
+    $checkTrim = New-Object System.Windows.Forms.CheckBox
+    $checkTrim.Location = New-Object System.Drawing.Point(520,300)
+    $checkTrim.Text = "TRIM"
+    $checkTrim.Checked = $false
+    $form.Controls.Add($checkTrim)
+
     $labelIterations = New-Object System.Windows.Forms.Label
-    $labelIterations.Location = New-Object System.Drawing.Point(10,305)
+    $labelIterations.Location = New-Object System.Drawing.Point(10,325)
     $labelIterations.Text = "Gutmann iterations:"
     $form.Controls.Add($labelIterations)
 
     $numericUpDownIterations = New-Object System.Windows.Forms.NumericUpDown
-    $numericUpDownIterations.Location = New-Object System.Drawing.Point(150,303)
+    $numericUpDownIterations.Location = New-Object System.Drawing.Point(130,323)
     $numericUpDownIterations.Minimum = 1
     $numericUpDownIterations.Maximum = 100
     $numericUpDownIterations.Value = 35
     $form.Controls.Add($numericUpDownIterations)
 
     $labelRename = New-Object System.Windows.Forms.Label
-    $labelRename.Location = New-Object System.Drawing.Point(250,305)
+    $labelRename.Location = New-Object System.Drawing.Point(270,325)
     $labelRename.Text = "Random renames:"
     $form.Controls.Add($labelRename)
 
     $numericRename = New-Object System.Windows.Forms.NumericUpDown
-    $numericRename.Location = New-Object System.Drawing.Point(360,303)
+    $numericRename.Location = New-Object System.Drawing.Point(380,323)
     $numericRename.Minimum = 0
     $numericRename.Maximum = 10
     $numericRename.Value = 3
     $form.Controls.Add($numericRename)
 
     $textBoxProgress = New-Object System.Windows.Forms.TextBox
-    $textBoxProgress.Location = New-Object System.Drawing.Point(10,335)
-    $textBoxProgress.Size = New-Object System.Drawing.Size(580,80)
+    $textBoxProgress.Location = New-Object System.Drawing.Point(10,355)
+    $textBoxProgress.Size = New-Object System.Drawing.Size(620,100)
     $textBoxProgress.Multiline = $true
     $textBoxProgress.ScrollBars = "Vertical"
     $form.Controls.Add($textBoxProgress)
 
-    $buttonDelete = New-Object System.Windows.Forms.Button
-    $buttonDelete.Location = New-Object System.Drawing.Point(140,220)
-    $buttonDelete.Size = New-Object System.Drawing.Size(120,30)
-    $buttonDelete.Text = "Delete"
+    # Actions
     $buttonDelete.Add_Click({
         $items = @($listBox.SelectedItems)
         if ($items.Count -eq 0) { Write-Log "⚠ No file selected." $textBoxProgress; return }
@@ -547,21 +758,38 @@ function Start-ShredderGUI {
                 continue
             }
             $choice = $comboBoxAlgorithm.SelectedItem
+            $drv = Get-DriveLetterFromPath -FullPath $item
             switch -Wildcard ($choice) {
                 "UltraSecure*" {
-                    SecureDelete-File -Path $item -UltraSecure -Verify:$($checkVerify.Checked) -RenameCount ([int]$numericRename.Value) -Output $textBoxProgress
+                    SecureDelete-File -Path $item -UltraSecure -Verify:$($checkVerify.Checked) -RenameCount ([int]$numericRename.Value) -WipeFreeSpace:$($checkWipe.Checked) -Trim:$($checkTrim.Checked) -Output $textBoxProgress | Out-Null
                 }
                 "Gutmann*" {
-                    SecureDelete-File -Path $item -Algorithm Gutmann -Passes ([int]$numericUpDownIterations.Value) -RenameCount ([int]$numericRename.Value) -Output $textBoxProgress
+                    SecureDelete-File -Path $item -Algorithm Gutmann -Passes ([int]$numericUpDownIterations.Value) -RenameCount ([int]$numericRename.Value) -WipeFreeSpace:$($checkWipe.Checked) -Trim:$($checkTrim.Checked) -Output $textBoxProgress | Out-Null
                 }
                 "DoD*" {
-                    SecureDelete-File -Path $item -Algorithm DoD -RenameCount ([int]$numericRename.Value) -Output $textBoxProgress
+                    SecureDelete-File -Path $item -Algorithm DoD -RenameCount ([int]$numericRename.Value) -WipeFreeSpace:$($checkWipe.Checked) -Trim:$($checkTrim.Checked) -Output $textBoxProgress | Out-Null
                 }
             }
             $listBox.Items.Remove($item)
         }
     })
-    $form.Controls.Add($buttonDelete)
+
+    $buttonAnalyze.Add_Click({
+        $items = @($listBox.SelectedItems)
+        if ($items.Count -eq 0) {
+            Write-Log "ℹ Entrez un chemin à analyser (quick check)..." $textBoxProgress
+            $dlg = New-Object System.Windows.Forms.OpenFileDialog
+            $dlg.Multiselect = $false
+            $dlg.Filter = "All files (*.*)|*.*"
+            if ($dlg.ShowDialog() -eq "OK") { $items = @($dlg.FileName) } else { return }
+        }
+
+        foreach ($item in $items) {
+            $qc = Test-DeletionQuickCheck -Path $item
+            Write-Log ("► QuickCheck Score: {0}% — {1}" -f $qc.Score, $qc.Classification) $textBoxProgress
+            foreach ($line in $qc.Breakdown) { Write-Log ("   " + $line) $textBoxProgress }
+        }
+    })
 
     $comboBoxAlgorithm.add_SelectedIndexChanged({
         $numericUpDownIterations.Enabled = ($comboBoxAlgorithm.SelectedItem -like "Gutmann*")
@@ -571,34 +799,40 @@ function Start-ShredderGUI {
     $form.ShowDialog() | Out-Null
 }
 
-# --- Entrée : CLI vs GUI ---
+# -----------------------------
+# Entry point: CLI or GUI
+# -----------------------------
 if ($NoUI) {
-    if (-not $Path) { throw "In CLI mode (-NoUI), provide -Path (file or folder)." }
+    if (-not $Path) {
+        throw "In CLI mode (-NoUI), you must provide -Path (file or folder)."
+    }
 
     if ($Confirm) {
         $q = Read-Host "DELETE '$Path' using $(if($UltraSecure){'UltraSecure'}else{$Algorithm})? (Y/N)"
         if ($q -notin @('Y','y','O','o')) { Write-Host "Cancelled."; exit 0 }
     }
 
-    $touchedDrives = New-Object System.Collections.Generic.HashSet[string]
+    $result = $null
 
     if (Test-Path -LiteralPath $Path -PathType Leaf) {
-        SecureDelete-File -Path $Path -Algorithm $Algorithm -Passes $Passes -UltraSecure:$UltraSecure -Verify:$Verify -RenameCount $RenameCount
-        $drv = Get-DriveLetterFromPath -FullPath $Path
-        if ($drv) { [void]$touchedDrives.Add($drv) }
+        $result = SecureDelete-File -Path $Path -Algorithm $Algorithm -Passes $Passes -UltraSecure:$UltraSecure -Verify:$Verify -RenameCount $RenameCount -WipeFreeSpace:$WipeFreeSpace -Trim:$Trim
     } elseif (Test-Path -LiteralPath $Path -PathType Container) {
-        SecureDelete-Folder -FolderPath $Path -Algorithm $Algorithm -Passes $Passes -UltraSecure:$UltraSecure -Verify:$Verify -RenameCount $RenameCount -Recurse:$Recurse -WipeFreeSpace:$WipeFreeSpace -Trim:$Trim
-        $drv = Get-DriveLetterFromPath -FullPath $Path
-        if ($drv) { [void]$touchedDrives.Add($drv) }
+        $result = SecureDelete-Folder -FolderPath $Path -Algorithm $Algorithm -Passes $Passes -UltraSecure:$UltraSecure -Verify:$Verify -RenameCount $RenameCount -Recurse:$Recurse -WipeFreeSpace:$WipeFreeSpace -Trim:$Trim
     } else {
         throw "Path not found: $Path"
     }
 
-    # Si l’utilisateur demande WipeFreeSpace/Trim pour fichier isolé
-    if ((-not (Test-Path -LiteralPath $Path -PathType Container)) -and $WipeFreeSpace -and $touchedDrives.Count -gt 0) {
-        foreach ($drive in $touchedDrives) {
-            Invoke-FreeSpaceWipe -DriveLetter $drive
-            if ($Trim) { Invoke-ReTrim -DriveLetter $drive }
+    if ($VerifyDeletion) {
+        if ($result -and $result.Score) {
+            $s = $result.Score
+            Write-Host ""
+            Write-Host ("=== Deletion Score ===`nScore: {0}%`nClass: {1}" -f $s.Score, $s.Classification)
+            Write-Host ("Details:`n - " + ($s.Breakdown -join "`n - "))
+        } else {
+            # Aucun log d’opération (ex: vérification indépendante)
+            $qc = Test-DeletionQuickCheck -Path $Path
+            Write-Host ("[QuickCheck] Score: {0}% — {1}" -f $qc.Score, $qc.Classification)
+            Write-Host ("Details:`n - " + ($qc.Breakdown -join "`n - "))
         }
     }
 } else {
