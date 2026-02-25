@@ -285,6 +285,7 @@ function Start-ShredderGUI {
     $form.ForeColor = "#FFFFFF"
     $form.Font = New-Object Drawing.Font("Segoe UI", 10)
 
+    # Liste des éléments (fichiers/dossiers)
     $listBox = New-Object System.Windows.Forms.ListBox
     $listBox.Location = "10,10"
     $listBox.Size = "780,250"
@@ -301,8 +302,10 @@ function Start-ShredderGUI {
             if ($_.Data.GetDataPresent([Windows.Forms.DataFormats]::FileDrop)) { $_.Effect = "Copy" }
         })
     $listBox.Add_DragDrop({
-            $files = $_.Data.GetData([Windows.Forms.DataFormats]::FileDrop)
-            foreach ($f in $files) { if (-not $listBox.Items.Contains($f)) { $listBox.Items.Add($f) } }
+            $items = $_.Data.GetData([Windows.Forms.DataFormats]::FileDrop)
+            foreach ($i in $items) {
+                if (-not $listBox.Items.Contains($i)) { $listBox.Items.Add($i) }
+            }
             Update-Summary
         })
 
@@ -317,54 +320,70 @@ function Start-ShredderGUI {
         return $b
     }
 
+    # --- Toolbar des boutons / contrôles (fix: reduce button sizes) ---
+    $panelButtons = New-Object System.Windows.Forms.Panel
+    $panelButtons.Location = "10,270"
+    $panelButtons.Size = "780,60"
+    $panelButtons.BackColor = "#313338"
+    $form.Controls.Add($panelButtons)
+
+    # Boutons / Contrôles
     $btnAdd = New-DiscordBtn "Add files..." "#5865F2"
-    $btnAdd.Location = "10,280"
-    $btnAdd.Size = "150,40"
-    $form.Controls.Add($btnAdd)
+    $btnAdd.Size = "120,40"
+    $btnAdd.Parent = $panelButtons
+    $btnAdd.Location = "0,10"
+
+    $btnAddFolder = New-DiscordBtn "Add folder..." "#5865F2"
+    $btnAddFolder.Size = "120,40"
+    $btnAddFolder.Parent = $panelButtons
+    $btnAddFolder.Location = "130,10"
 
     $btnDelete = New-DiscordBtn "Delete securely" "#ED4245"
-    $btnDelete.Location = "170,280"
-    $btnDelete.Size = "150,40"
-    $form.Controls.Add($btnDelete)
+    $btnDelete.Size = "120,40"
+    $btnDelete.Parent = $panelButtons
+    $btnDelete.Location = "260,10"
 
     $btnClearLogs = New-DiscordBtn "Clear logs" "#4F545C"
-    $btnClearLogs.Location = "330,280"
-    $btnClearLogs.Size = "120,40"
-    $form.Controls.Add($btnClearLogs)
+    $btnClearLogs.Size = "100,40"
+    $btnClearLogs.Parent = $panelButtons
+    $btnClearLogs.Location = "390,10"
 
     $comboBoxAlgorithm = New-Object System.Windows.Forms.ComboBox
-    $comboBoxAlgorithm.Location = "10,330"
-    $comboBoxAlgorithm.Size = "260,30"
+    $comboBoxAlgorithm.Size = "160,30"
     $comboBoxAlgorithm.BackColor = "#1E1F22"
     $comboBoxAlgorithm.ForeColor = "White"
     $comboBoxAlgorithm.Items.Add("Gutmann (35 passes)")
     $comboBoxAlgorithm.Items.Add("DoD 5220.22-M (3 passes)")
     $comboBoxAlgorithm.SelectedIndex = 0
-    $form.Controls.Add($comboBoxAlgorithm)
+    $comboBoxAlgorithm.Parent = $panelButtons
+    $comboBoxAlgorithm.Location = "500,15"
 
     $numericUpDownIterations = New-Object System.Windows.Forms.NumericUpDown
-    $numericUpDownIterations.Location = "280,330"
     $numericUpDownIterations.Minimum = 1
     $numericUpDownIterations.Maximum = 100
     $numericUpDownIterations.Value = 35
     $numericUpDownIterations.BackColor = "#1E1F22"
     $numericUpDownIterations.ForeColor = "White"
-    $form.Controls.Add($numericUpDownIterations)
+    $numericUpDownIterations.Size = "50,30"
+    $numericUpDownIterations.Parent = $panelButtons
+    $numericUpDownIterations.Location = "665,15"
 
     $comboBoxAlgorithm.Add_SelectedIndexChanged({
             $numericUpDownIterations.Enabled = ($comboBoxAlgorithm.SelectedItem -like "Gutmann*")
         })
 
+    # Progress bar
     $progressBar = New-Object System.Windows.Forms.ProgressBar
-    $progressBar.Location = "10,370"
+    $progressBar.Location = "10,340"
     $progressBar.Size = "780,20"
     $progressBar.Style = "Continuous"
     $progressBar.Anchor = "Top,Left,Right"
     $form.Controls.Add($progressBar)
 
+    # Logs
     $textBoxProgress = New-Object System.Windows.Forms.TextBox
-    $textBoxProgress.Location = "10,400"
-    $textBoxProgress.Size = "780,210"
+    $textBoxProgress.Location = "10,370"
+    $textBoxProgress.Size = "780,240"
     $textBoxProgress.Multiline = $true
     $textBoxProgress.ScrollBars = "Vertical"
     $textBoxProgress.BackColor = "#1E1F22"
@@ -385,6 +404,17 @@ function Start-ShredderGUI {
             }
         })
 
+    $btnAddFolder.Add_Click({
+            $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+            if ($dlg.ShowDialog() -eq "OK") {
+                if (-not $listBox.Items.Contains($dlg.SelectedPath)) {
+                    $listBox.Items.Add($dlg.SelectedPath)
+                }
+                Update-Summary
+            }
+        })
+
+    # Sidebar (Résumé)
     $sidebar = New-Object System.Windows.Forms.Panel
     $sidebar.Location = "800,10"
     $sidebar.Size = "280,600"
@@ -429,13 +459,33 @@ function Start-ShredderGUI {
     $sidebar.Controls.Add($linkGitHub)
 
     function Update-Summary {
+
         $count = $listBox.Items.Count
-        $labelCount.Text = "Files: $count"
-        $size = 0
-        foreach ($f in $listBox.Items) { if (Test-Path $f) { $size += (Get-Item $f).Length } }
-        $labelSize.Text = "Total size: {0:N0} bytes" -f $size
+        $labelCount.Text = "Items: $count"
+
+        $total = 0L
+
+        foreach ($i in $listBox.Items) {
+
+            if (Test-Path $i -PathType Leaf) {
+                try { $total += (Get-Item $i -ErrorAction Stop).Length } catch {}
+            }
+            elseif (Test-Path $i -PathType Container) {
+                try {
+                    $files = Get-ChildItem $i -Recurse -File -Force -ErrorAction SilentlyContinue
+                    if ($files) {
+                        $sum = ($files | Measure-Object Length -Sum).Sum
+                        if ($sum) { $total += [int64]$sum }
+                    }
+                }
+                catch {}
+            }
+        }
+
+        $labelSize.Text = "Total size: {0:N0} bytes" -f $total
     }
 
+    # Suppression
     $btnDelete.Add_Click({
 
             $items = @($listBox.SelectedItems)
@@ -449,20 +499,40 @@ function Start-ShredderGUI {
             $global:__TotalSteps = 0
 
             foreach ($i in $items) {
-                $p = ($comboBoxAlgorithm.SelectedItem -like "Gutmann*") ? $numericUpDownIterations.Value : 3
-                $global:__TotalSteps += ($p + 3)
+
+                $isFolder = Test-Path $i -PathType Container
+                $isFile = Test-Path $i -PathType Leaf
+
+                $passes = ($comboBoxAlgorithm.SelectedItem -like "Gutmann*") ? 
+                [int]$numericUpDownIterations.Value : 
+                3
+
+                if ($isFile) {
+                    $global:__TotalSteps += ($passes + 3)
+                }
+                elseif ($isFolder) {
+                    $files = Get-ChildItem $i -Recurse -File -Force -ErrorAction SilentlyContinue
+                    $global:__TotalSteps += ($files.Count * ($passes + 3))
+                }
             }
 
             $progressBar.Minimum = 0
             $progressBar.Maximum = [Math]::Max($global:__TotalSteps, 1)
             $progressBar.Value = 0
 
-            Write-Log "Processing $($items.Count) files..." $textBoxProgress
+            Write-Log "Processing $($items.Count) items..." $textBoxProgress
 
             foreach ($item in $items) {
                 $algo = if ($comboBoxAlgorithm.SelectedItem -like "Gutmann*") { "Gutmann" } else { "DoD" }
                 $p = if ($algo -eq "Gutmann") { [int]$numericUpDownIterations.Value } else { 3 }
-                SecureDelete-File -Path $item -Algorithm $algo -Passes $p -Output $textBoxProgress
+
+                if (Test-Path $item -PathType Container) {
+                    SecureDelete-Folder -FolderPath $item -Algorithm $algo -Passes $p -Recurse -Output $textBoxProgress
+                }
+                elseif (Test-Path $item -PathType Leaf) {
+                    SecureDelete-File -Path $item -Algorithm $algo -Passes $p -Output $textBoxProgress
+                }
+
                 $listBox.Items.Remove($item)
             }
 
@@ -482,7 +552,7 @@ public static class PBState {
             Write-Log "✔ Completed." $textBoxProgress
             Update-Summary
         })
-
+    Update-Summary
     $form.ShowDialog()
 }
 
@@ -491,7 +561,7 @@ if ($NoUI) {
     if (-not $Path) { throw "In CLI mode, you must provide -Path." }
     if ($AskConfirmation) {
         $q = Read-Host "DELETE '$Path' using $Algorithm ? (Y/N)"
-        if ($q -notin @('Y','y','O','o')) { Write-Host "Cancelled."; exit }
+        if ($q -notin @('Y', 'y', 'O', 'o')) { Write-Host "Cancelled."; exit }
     }
     if (Test-Path -LiteralPath $Path -PathType Leaf) {
         SecureDelete-File -Path $Path -Algorithm $Algorithm -Passes $Passes
