@@ -1,27 +1,20 @@
 ﻿param(
     [Parameter(Mandatory = $false)]
     [string]$Path,
-
     [ValidateSet("Gutmann", "DoD")]
     [string]$Algorithm = "Gutmann",
-
     [int]$Passes = 35,
-
     [switch]$Recurse,
-
     [switch]$NoUI,
-
     [switch]$AskConfirmation
 )
+
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-# -----------------------------
-# Utility: Safe logging
-# -----------------------------
 function Write-Log {
-    param (
+    param(
         [string]$Message,
         [System.Windows.Forms.TextBox]$TextBox
     )
@@ -36,144 +29,87 @@ function Write-Log {
     }
 }
 
-# -----------------------------
-# Random overwrite (strong RNG)
-# -----------------------------
-function Overwrite-RandomData {
-    param ([string]$Path)
-
-    # --- progression helper ---
-    $prog = {
-        if (Get-Variable -Name __TotalSteps -Scope Global -ErrorAction SilentlyContinue) {
-            $global:__ProgStep = [Math]::Min($global:__ProgStep + 1, $global:__TotalSteps)
-
-            if (Get-Variable -Name __ProgressBar -Scope Global -ErrorAction SilentlyContinue) {
-                try { $global:__ProgressBar.Value = $global:__ProgStep } catch {}
-            }
+function Update-ProgressStep {
+    if (Get-Variable -Name __TotalSteps -Scope Global -ErrorAction SilentlyContinue) {
+        $global:__ProgStep = [Math]::Min($global:__ProgStep + 1, $global:__TotalSteps)
+        if (Get-Variable -Name __ProgressBar -Scope Global -ErrorAction SilentlyContinue) {
+            try { $global:__ProgressBar.Value = $global:__ProgStep } catch {}
         }
     }
+}
 
+function Overwrite-RandomData {
+    param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
-
     try {
         $size = (Get-Item -LiteralPath $Path -Force).Length
         if ($size -le 0) { return }
-
-        # generate cryptographic random buffer
         $buf = New-Object byte[] $size
         $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
         $rng.GetBytes($buf)
-
-        # write overwrite
         [System.IO.File]::WriteAllBytes($Path, $buf)
-
-        # mark overwrite step as done
-        & $prog
+        Update-ProgressStep
     }
     catch {
         throw "Overwrite-RandomData failed for '$Path': $($_.Exception.Message)"
     }
 }
 
-# -----------------------------
-# DoD secure deletion
-# -----------------------------
 function SecureDelete-DoD {
-    param (
+    param(
         [string]$Path,
         [System.Windows.Forms.TextBox]$Output
     )
-
-    # --- progression helper (no-op si les variables globales n'existent pas) ---
-    $prog = {
-        if (Get-Variable -Name __TotalSteps -Scope Global -ErrorAction SilentlyContinue) {
-            $global:__ProgStep = [Math]::Min($global:__ProgStep + 1, $global:__TotalSteps)
-            if (Get-Variable -Name __ProgressBar -Scope Global -ErrorAction SilentlyContinue) {
-                try { $global:__ProgressBar.Value = $global:__ProgStep } catch {}
-            }
-        }
-    }
-
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
     if ($item.PSIsContainer) { throw "SecureDelete-DoD expects a file." }
-
     $size = $item.Length
     $patterns = @(0x00, 0xFF, $null)
-
-    for ($i = 0; $i -lt $patterns.Count; $i++) {
+    for ($i = 0; $i -lt 3; $i++) {
         $pattern = $patterns[$i]
-
         if ($pattern -eq $null) {
             Write-Log "DoD pass $($i+1)/3 (random) on $Path..." $Output
             Overwrite-RandomData -Path $Path
-            & $prog
         }
         else {
             Write-Log "DoD pass $($i+1)/3 (pattern 0x{0:X2}) on $Path..." -f $pattern $Output
             $buf = New-Object byte[] $size
             for ($j = 0; $j -lt $size; $j++) { $buf[$j] = [byte]$pattern }
             [System.IO.File]::WriteAllBytes($Path, $buf)
-            & $prog
+            Update-ProgressStep
         }
     }
-
     Remove-Item -LiteralPath $Path -Force
-    & $prog   # progression pour l'opération de suppression elle-même
+    Update-ProgressStep
     Write-Log "✔ Deleted (DoD): $Path" $Output
 }
 
-# -----------------------------
-# Gutmann secure deletion
-# -----------------------------
 function SecureDelete-Gutmann {
-    param (
+    param(
         [string]$Path,
         [int]$Iterations = 35,
         [System.Windows.Forms.TextBox]$Output
     )
-
-    # --- progression helper ---
-    $prog = {
-        if (Get-Variable -Name __TotalSteps -Scope Global -ErrorAction SilentlyContinue) {
-            $global:__ProgStep = [Math]::Min($global:__ProgStep + 1, $global:__TotalSteps)
-            if (Get-Variable -Name __ProgressBar -Scope Global -ErrorAction SilentlyContinue) {
-                try { $global:__ProgressBar.Value = $global:__ProgStep } catch {}
-            }
-        }
-    }
-
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
     if ($item.PSIsContainer) { throw "SecureDelete-Gutmann expects a file." }
-
     for ($i = 1; $i -le $Iterations; $i++) {
         Write-Log "Gutmann pass $i/$Iterations on $Path..." $Output
         Overwrite-RandomData -Path $Path
-        & $prog
+        Update-ProgressStep
     }
-
     Remove-Item -LiteralPath $Path -Force
-    & $prog   # progression pour l'opération de suppression
+    Update-ProgressStep
     Write-Log "✔ Deleted (Gutmann $Iterations passes): $Path" $Output
 }
 
-# -----------------------------
-# Get alternate streams safely
-# -----------------------------
 function Get-AlternateStreams {
     param([string]$Path)
-
     try {
         Get-Item -LiteralPath $Path -Force -Stream * -ErrorAction Stop |
         Where-Object { $_.Stream -notin @('::$DATA', ':$DATA', '$DATA') }
     }
-    catch {
-        return @()  # No ADS or non-NTFS
-    }
+    catch { return @() }
 }
 
-# -----------------------------
-# ADS secure removal
-# -----------------------------
 function Remove-ADS-Secure {
     param(
         [string]$Path,
@@ -181,50 +117,35 @@ function Remove-ADS-Secure {
         [int]$Passes = 35,
         [System.Windows.Forms.TextBox]$Output
     )
-
-    # --- progression helper ---
-    $prog = {
-        if (Get-Variable -Name __TotalSteps -Scope Global -ErrorAction SilentlyContinue) {
-            $global:__ProgStep = [Math]::Min($global:__ProgStep + 1, $global:__TotalSteps)
-            if (Get-Variable -Name __ProgressBar -Scope Global -ErrorAction SilentlyContinue) {
-                try { $global:__ProgressBar.Value = $global:__ProgStep } catch {}
-            }
-        }
-    }
-
     $adsList = Get-AlternateStreams -Path $Path
-
     foreach ($ads in $adsList) {
         $adsPath = "$Path`:$($ads.Stream)"
-
         Write-Log "Processing ADS '$($ads.Stream)' on $Path" $Output
-
         try {
             switch ($Algorithm) {
                 "Gutmann" {
                     for ($i = 1; $i -le $Passes; $i++) {
                         Overwrite-RandomData -Path $adsPath
-                        & $prog
+                        Update-ProgressStep
                     }
                 }
                 "DoD" {
                     $len = $ads.Length
                     $buf0 = New-Object byte[] $len
                     $buf1 = New-Object byte[] $len
-                    for ($j = 0; $j -lt $len; $j++) { $buf0[$j] = 0x00; $buf1[$j] = 0xFF }
-
+                    for ($j = 0; $j -lt $len; $j++) {
+                        $buf0[$j] = 0x00
+                        $buf1[$j] = 0xFF
+                    }
                     [IO.File]::WriteAllBytes($adsPath, $buf0)
-                    & $prog
-
+                    Update-ProgressStep
                     [IO.File]::WriteAllBytes($adsPath, $buf1)
-                    & $prog
-
+                    Update-ProgressStep
                     Overwrite-RandomData -Path $adsPath
-                    & $prog
                 }
             }
             Remove-Item -LiteralPath $adsPath -Force -ErrorAction SilentlyContinue
-            & $prog   # progression pour la suppression du flux
+            Update-ProgressStep
         }
         catch {
             Write-Log "⚠ ADS wipe failed for $adsPath : $($_.Exception.Message)" $Output
@@ -232,20 +153,49 @@ function Remove-ADS-Secure {
     }
 }
 
-# -----------------------------
-# Prepare file (attributes + rename)
-# -----------------------------
+function Check-ResidualArtifacts {
+    param(
+        [string]$OriginalPath,
+        [System.Windows.Forms.TextBox]$Output
+    )
+    Write-Log "🔍 Vérification résiduelle : $OriginalPath" $Output
+    if (Test-Path -LiteralPath $OriginalPath) {
+        Write-Log "❌ Le fichier existe encore !" $Output
+        return $false
+    }
+    try {
+        $streams = Get-Item -LiteralPath $OriginalPath -Force -Stream * -ErrorAction Stop |
+        Where-Object { $_.Stream -notin @('::$DATA', ':$DATA', '$DATA') }
+        if ($streams.Count -gt 0) {
+            Write-Log "❌ ADS résiduels détectés :" $Output
+            foreach ($s in $streams) { Write-Log "   → $($s.Stream)" $Output }
+            return $false
+        }
+    }
+    catch {}
+    try {
+        $parent = Split-Path $OriginalPath -Parent
+        $tmp = Join-Path $parent ".__shredder_lock_test"
+        [IO.File]::WriteAllText($tmp, "x")
+        Remove-Item $tmp -Force -EA SilentlyContinue
+    }
+    catch {
+        Write-Log "⚠ Handle verrouillant le dossier parent." $Output
+        return $false
+    }
+    Write-Log "✔ Aucun résidu détecté." $Output
+    return $true
+}
+
 function Prepare-FileForDeletion {
     param(
         [string]$Path,
         [switch]$RandomizeName
     )
-
     try {
-        Attrib -R -S -H -A -I -O -U -P -Q -Y -LiteralPath $Path *>$null
+        Attrib -R -S -H -A -I -O -U -P -Q -Y -LiteralPath $Path *> $null
     }
-    catch { }
-
+    catch {}
     if ($RandomizeName) {
         try {
             $dir = Split-Path $Path -Parent
@@ -260,56 +210,9 @@ function Prepare-FileForDeletion {
         }
         catch { return $Path }
     }
-
     return $Path
 }
 
-# -----------------------------
-# Residual artifact detection
-# -----------------------------
-function Check-ResidualArtifacts {
-    param(
-        [string]$OriginalPath,
-        [System.Windows.Forms.TextBox]$Output
-    )
-
-    Write-Log "🔍 Vérification résiduelle : $OriginalPath" $Output
-
-    if (Test-Path -LiteralPath $OriginalPath) {
-        Write-Log "❌ Le fichier existe encore !" $Output
-        return $false
-    }
-
-    try {
-        $streams = Get-Item -LiteralPath $OriginalPath -Force -Stream * -ErrorAction Stop |
-        Where-Object { $_.Stream -notin @('::$DATA', ':$DATA', '$DATA') }
-
-        if ($streams.Count -gt 0) {
-            Write-Log "❌ ADS résiduels détectés :" $Output
-            foreach ($s in $streams) { Write-Log "   → $($s.Stream)" $Output }
-            return $false
-        }
-    }
-    catch { }
-
-    $parent = Split-Path $OriginalPath -Parent
-    try {
-        $tmp = Join-Path $parent ".__shredder_lock_test"
-        [IO.File]::WriteAllText($tmp, "x")
-        Remove-Item $tmp -Force -EA SilentlyContinue
-    }
-    catch {
-        Write-Log "⚠ Handle verrouillant le dossier parent." $Output
-        return $false
-    }
-
-    Write-Log "✔ Aucun résidu détecté." $Output
-    return $true
-}
-
-# -----------------------------
-# Secure delete file
-# -----------------------------
 function SecureDelete-File {
     param(
         [string]$Path,
@@ -317,26 +220,19 @@ function SecureDelete-File {
         [int]$Passes = 35,
         [System.Windows.Forms.TextBox]$Output
     )
-
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         Write-Log "⚠ File not found: $Path" $Output
         return
     }
-
     $path2 = Prepare-FileForDeletion -Path $Path -RandomizeName
     Remove-ADS-Secure -Path $path2 -Algorithm $Algorithm -Passes $Passes -Output $Output
-
     switch ($Algorithm) {
         "Gutmann" { SecureDelete-Gutmann -Path $path2 -Iterations $Passes -Output $Output }
-        "DoD" { SecureDelete-DoD     -Path $path2 -Output $Output }
+        "DoD" { SecureDelete-DoD -Path $path2 -Output $Output }
     }
-
     Check-ResidualArtifacts -OriginalPath $Path -Output $Output
 }
 
-# -----------------------------
-# Secure delete folder
-# -----------------------------
 function SecureDelete-Folder {
     param(
         [string]$FolderPath,
@@ -345,54 +241,41 @@ function SecureDelete-Folder {
         [switch]$Recurse,
         [System.Windows.Forms.TextBox]$Output
     )
-
     if (-not (Test-Path -LiteralPath $FolderPath -PathType Container)) {
         Write-Log "⚠ Folder not found: $FolderPath" $Output
         return
     }
-
     $folderItem = Get-Item -LiteralPath $FolderPath -Force
     if ($folderItem.Attributes -band [IO.FileAttributes]::ReparsePoint) {
         Write-Log "⚠ Skipping reparse point: $FolderPath" $Output
         return
     }
-
     Write-Log "Scanning folder: $FolderPath" $Output
-
     $files = if ($Recurse) {
         Get-ChildItem $FolderPath -Recurse -File -Force
     }
     else {
         Get-ChildItem $FolderPath -File -Force
     }
-
     foreach ($f in $files) {
         SecureDelete-File -Path $f.FullName -Algorithm $Algorithm -Passes $Passes -Output $Output
     }
-
     $dirs = if ($Recurse) {
         Get-ChildItem $FolderPath -Recurse -Directory -Force | Sort-Object FullName -Descending
     }
-
     foreach ($d in $dirs) {
         if (-not ($d.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
             Remove-Item $d.FullName -Force -EA SilentlyContinue
         }
     }
-
     Remove-Item $FolderPath -Force -EA SilentlyContinue
     Write-Log "✔ Folder removed: $FolderPath" $Output
-
     Check-ResidualArtifacts -OriginalPath $FolderPath -Output $Output
 }
 
-# -----------------------------
-# GUI
-# -----------------------------
 
 function Start-ShredderGUI {
 
-    # ------- MAIN FORM -------
     $form = New-Object System.Windows.Forms.Form
     $form.Text = "Secure File Shredder"
     $form.Size = New-Object System.Drawing.Size(1100, 650)
@@ -402,11 +285,6 @@ function Start-ShredderGUI {
     $form.ForeColor = "#FFFFFF"
     $form.Font = New-Object Drawing.Font("Segoe UI", 10)
 
-    # --------------------------------------------------------
-    # LEFT AREA (FILES + CONTROLS)
-    # --------------------------------------------------------
-
-    # FILE LIST
     $listBox = New-Object System.Windows.Forms.ListBox
     $listBox.Location = "10,10"
     $listBox.Size = "780,250"
@@ -415,53 +293,45 @@ function Start-ShredderGUI {
     $listBox.ForeColor = "#B9BBBE"
     $listBox.SelectionMode = "MultiExtended"
     $listBox.HorizontalScrollbar = $true
+    $listBox.BorderStyle = "FixedSingle"
+    $listBox.AllowDrop = $true
     $form.Controls.Add($listBox)
 
-    # DRAG & DROP
-    $listBox.AllowDrop = $true
     $listBox.Add_DragEnter({
-        if ($_.Data.GetDataPresent([Windows.Forms.DataFormats]::FileDrop)) { $_.Effect = "Copy" }
-    })
+            if ($_.Data.GetDataPresent([Windows.Forms.DataFormats]::FileDrop)) { $_.Effect = "Copy" }
+        })
     $listBox.Add_DragDrop({
-        $files = $_.Data.GetData([Windows.Forms.DataFormats]::FileDrop)
-        foreach ($f in $files) {
-            if (-not $listBox.Items.Contains($f)) { $listBox.Items.Add($f) }
-        }
-        Update-Summary
-    })
+            $files = $_.Data.GetData([Windows.Forms.DataFormats]::FileDrop)
+            foreach ($f in $files) { if (-not $listBox.Items.Contains($f)) { $listBox.Items.Add($f) } }
+            Update-Summary
+        })
 
-    # BUTTON FACTORY
-    function New-DiscordButton($text, $color) {
-        $btn = New-Object System.Windows.Forms.Button
-        $btn.Text = $text
-        $btn.BackColor = $color
-        $btn.ForeColor = "White"
-        $btn.FlatStyle = "Flat"
-        $btn.FlatAppearance.BorderSize = 0
-        $btn.Font = $form.Font
-        return $btn
+    function New-DiscordBtn($text, $color) {
+        $b = New-Object System.Windows.Forms.Button
+        $b.Text = $text
+        $b.BackColor = $color
+        $b.ForeColor = "White"
+        $b.FlatStyle = "Flat"
+        $b.FlatAppearance.BorderSize = 0
+        $b.Font = $form.Font
+        return $b
     }
 
-    # BUTTONS
-    $btnAdd = New-DiscordButton "Add files..." "#5865F2"
+    $btnAdd = New-DiscordBtn "Add files..." "#5865F2"
     $btnAdd.Location = "10,280"
     $btnAdd.Size = "150,40"
-    $btnAdd.Anchor = "Top,Left"
     $form.Controls.Add($btnAdd)
 
-    $btnDelete = New-DiscordButton "Delete securely" "#ED4245"
+    $btnDelete = New-DiscordBtn "Delete securely" "#ED4245"
     $btnDelete.Location = "170,280"
     $btnDelete.Size = "150,40"
-    $btnDelete.Anchor = "Top,Left"
     $form.Controls.Add($btnDelete)
 
-    $btnClearLogs = New-DiscordButton "Clear logs" "#4F545C"
+    $btnClearLogs = New-DiscordBtn "Clear logs" "#4F545C"
     $btnClearLogs.Location = "330,280"
     $btnClearLogs.Size = "120,40"
-    $btnClearLogs.Anchor = "Top,Left"
     $form.Controls.Add($btnClearLogs)
 
-    # SETTINGS
     $comboBoxAlgorithm = New-Object System.Windows.Forms.ComboBox
     $comboBoxAlgorithm.Location = "10,330"
     $comboBoxAlgorithm.Size = "260,30"
@@ -482,17 +352,16 @@ function Start-ShredderGUI {
     $form.Controls.Add($numericUpDownIterations)
 
     $comboBoxAlgorithm.Add_SelectedIndexChanged({
-        $numericUpDownIterations.Enabled = ($comboBoxAlgorithm.SelectedItem -like "Gutmann*")
-    })
+            $numericUpDownIterations.Enabled = ($comboBoxAlgorithm.SelectedItem -like "Gutmann*")
+        })
 
-    # PROGRESS BAR
     $progressBar = New-Object System.Windows.Forms.ProgressBar
     $progressBar.Location = "10,370"
     $progressBar.Size = "780,20"
+    $progressBar.Style = "Continuous"
     $progressBar.Anchor = "Top,Left,Right"
     $form.Controls.Add($progressBar)
 
-    # LOGS
     $textBoxProgress = New-Object System.Windows.Forms.TextBox
     $textBoxProgress.Location = "10,400"
     $textBoxProgress.Size = "780,210"
@@ -503,24 +372,18 @@ function Start-ShredderGUI {
     $textBoxProgress.Anchor = "Top,Left,Right,Bottom"
     $form.Controls.Add($textBoxProgress)
 
-    # CLEAR LOGS
     $btnClearLogs.Add_Click({ $textBoxProgress.Clear() })
 
-    # ADD FILES
     $btnAdd.Add_Click({
-        $dlg = New-Object System.Windows.Forms.OpenFileDialog
-        $dlg.Multiselect = $true
-        if ($dlg.ShowDialog() -eq "OK") {
-            foreach ($f in $dlg.FileNames) {
-                if (-not $listBox.Items.Contains($f)) { $listBox.Items.Add($f) }
+            $dlg = New-Object System.Windows.Forms.OpenFileDialog
+            $dlg.Multiselect = $true
+            if ($dlg.ShowDialog() -eq "OK") {
+                foreach ($f in $dlg.FileNames) {
+                    if (-not $listBox.Items.Contains($f)) { $listBox.Items.Add($f) }
+                }
+                Update-Summary
             }
-            Update-Summary
-        }
-    })
-
-    # --------------------------------------------------------
-    # RIGHT SIDEBAR SUMMARY (fix)
-    # --------------------------------------------------------
+        })
 
     $sidebar = New-Object System.Windows.Forms.Panel
     $sidebar.Location = "800,10"
@@ -530,95 +393,106 @@ function Start-ShredderGUI {
     $sidebar.BorderStyle = "FixedSingle"
     $form.Controls.Add($sidebar)
 
-    # SIDEBAR TITLE
     $lblTitle = New-Object System.Windows.Forms.Label
     $lblTitle.Text = "Summary"
-    $lblTitle.Font = New-Object Drawing.Font("Segoe UI", 12, "Bold")
+    $lblTitle.Font = New-Object Drawing.Font("Segoe UI", 12, [System.Drawing.FontStyle]::Bold)
     $lblTitle.Location = "10,10"
     $lblTitle.ForeColor = "White"
     $sidebar.Controls.Add($lblTitle)
 
-    # COUNT
     $labelCount = New-Object System.Windows.Forms.Label
     $labelCount.Location = "10,50"
     $labelCount.ForeColor = "White"
     $sidebar.Controls.Add($labelCount)
 
-    # SIZE
     $labelSize = New-Object System.Windows.Forms.Label
     $labelSize.Location = "10,80"
     $labelSize.ForeColor = "White"
     $sidebar.Controls.Add($labelSize)
 
-    # Function update summary
+    $labelCredit = New-Object System.Windows.Forms.Label
+    $labelCredit.Text = "Created by Pierre CHAUSSARD"
+    $labelCredit.Font = New-Object Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Italic)
+    $labelCredit.ForeColor = "#B9BBBE"
+    $labelCredit.AutoSize = $true
+    $labelCredit.Location = New-Object System.Drawing.Point(10, 540)
+    $sidebar.Controls.Add($labelCredit)
+
+    $linkGitHub = New-Object System.Windows.Forms.LinkLabel
+    $linkGitHub.Text = "github.com/PierreChrd"
+    $linkGitHub.LinkColor = "#00AFF4"
+    $linkGitHub.ActiveLinkColor = "#3BA55D"
+    $linkGitHub.VisitedLinkColor = "#7289DA"
+    $linkGitHub.Location = New-Object System.Drawing.Point(10, 560)
+    $linkGitHub.AutoSize = $true
+    $linkGitHub.Add_LinkClicked({ Start-Process "https://github.com/PierreChrd" })
+    $sidebar.Controls.Add($linkGitHub)
+
     function Update-Summary {
         $count = $listBox.Items.Count
         $labelCount.Text = "Files: $count"
-
-        $total = 0
-        foreach ($f in $listBox.Items) {
-            if (Test-Path $f) { $total += (Get-Item $f).Length }
-        }
-        $labelSize.Text = "Total size: {0:N0} bytes" -f $total
+        $size = 0
+        foreach ($f in $listBox.Items) { if (Test-Path $f) { $size += (Get-Item $f).Length } }
+        $labelSize.Text = "Total size: {0:N0} bytes" -f $size
     }
-
-    # --------------------------------------------------------
-    # DELETE FILES (progress bar FIXED)
-    # --------------------------------------------------------
 
     $btnDelete.Add_Click({
 
-        $items = @($listBox.SelectedItems)
-        if ($items.Count -eq 0) {
-            Write-Log "⚠ No file selected." $textBoxProgress
-            return
-        }
+            $items = @($listBox.SelectedItems)
+            if ($items.Count -eq 0) {
+                Write-Log "⚠ No file selected." $textBoxProgress
+                return
+            }
 
-        # INITIALISE GLOBAL PROGRESS BAR ACCESS
-        $global:__ProgressBar = $progressBar
-        $global:__ProgStep = 0
-        $global:__TotalSteps = 0
+            $global:__ProgressBar = $progressBar
+            $global:__ProgStep = 0
+            $global:__TotalSteps = 0
 
-        foreach ($i in $items) {
-            $passes = ($comboBoxAlgorithm.SelectedItem -like "Gutmann*") ? $numericUpDownIterations.Value : 3
-            $global:__TotalSteps += ($passes + 3)
-        }
+            foreach ($i in $items) {
+                $p = ($comboBoxAlgorithm.SelectedItem -like "Gutmann*") ? $numericUpDownIterations.Value : 3
+                $global:__TotalSteps += ($p + 3)
+            }
 
-        $progressBar.Minimum = 0
-        $progressBar.Maximum = [Math]::Max($global:__TotalSteps, 1)
-        $progressBar.Value = 0
+            $progressBar.Minimum = 0
+            $progressBar.Maximum = [Math]::Max($global:__TotalSteps, 1)
+            $progressBar.Value = 0
 
-        Write-Log "Processing $($items.Count) files..." $textBoxProgress
+            Write-Log "Processing $($items.Count) files..." $textBoxProgress
 
-        foreach ($item in $items) {
+            foreach ($item in $items) {
+                $algo = if ($comboBoxAlgorithm.SelectedItem -like "Gutmann*") { "Gutmann" } else { "DoD" }
+                $p = if ($algo -eq "Gutmann") { [int]$numericUpDownIterations.Value } else { 3 }
+                SecureDelete-File -Path $item -Algorithm $algo -Passes $p -Output $textBoxProgress
+                $listBox.Items.Remove($item)
+            }
 
-            $algo = if ($comboBoxAlgorithm.SelectedItem -like "Gutmann*") { "Gutmann" } else { "DoD" }
-            $passes = if ($algo -eq "Gutmann") { [int]$numericUpDownIterations.Value } else { 3 }
+            $global:__ProgStep = $global:__TotalSteps
+            $progressBar.Value = $global:__TotalSteps
 
-            SecureDelete-File -Path $item -Algorithm $algo -Passes $passes -Output $textBoxProgress
+            Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public static class PBState {
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    public static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+}
+"@
+            [PBState]::SendMessage($progressBar.Handle, 0x0410, 1, 0)
 
-            $listBox.Items.Remove($item)
-        }
+            Write-Log "✔ Completed." $textBoxProgress
+            Update-Summary
+        })
 
-        Write-Log "✔ Completed." $textBoxProgress
-        Update-Summary
-    })
-
-    # SHOW GUI
     $form.ShowDialog()
 }
 
-# -----------------------------
-# ENTRY POINT
-# -----------------------------
+
 if ($NoUI) {
     if (-not $Path) { throw "In CLI mode, you must provide -Path." }
-
     if ($AskConfirmation) {
         $q = Read-Host "DELETE '$Path' using $Algorithm ? (Y/N)"
-        if ($q -notin @('Y', 'y', 'O', 'o')) { Write-Host "Cancelled."; exit }
+        if ($q -notin @('Y','y','O','o')) { Write-Host "Cancelled."; exit }
     }
-
     if (Test-Path -LiteralPath $Path -PathType Leaf) {
         SecureDelete-File -Path $Path -Algorithm $Algorithm -Passes $Passes
     }
