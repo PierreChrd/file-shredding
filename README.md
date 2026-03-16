@@ -175,6 +175,8 @@ Pour les SSD :
 ---
 
 ## Licence
-À définir par l'auteur.
+Ce projet est distribué sous licence **GNU General Public License v3.0**.  
+Voir le fichier `LICENSE` pour les détails.
 
+## Auteur
 > Créé par **Pierre CHAUSSARD** — https://github.com/PierreChrd
