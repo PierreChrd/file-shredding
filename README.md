@@ -1,4 +1,4 @@
-# Secure File Shredder (PowerShell)
+# 🗑️ Secure File Shredder (PowerShell)
 
 ![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-blue?logo=powershell)
 ![Windows](https://img.shields.io/badge/OS-Windows%2010%2F11-informational?logo=windows)
